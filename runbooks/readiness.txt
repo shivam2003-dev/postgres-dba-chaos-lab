@@ -1,0 +1,8 @@
+#Switch user to postgres
+sudo su - postgres
+
+#Verify replications
+psql -p 5432 -c "select pg_is_in_recovery();"
+psql -p 5433 -c "select pg_is_in_recovery();"
+psql -p 5434 -c "select pg_is_in_recovery();"
+psql -p 5432 -c "select slot_name, slot_type from pg_replication_slots;"

@@ -1,0 +1,168 @@
+================================================================================
+  RUNBOOK: PostgreSQL Ransomware Simulation & PITR Recovery
+  Environment : Primary (5432) | Replica1 (5433) | Replica2 (5434)
+================================================================================
+
+--------------------------------------------------------------------------------
+STEP 1 — PRE-ATTACK: VERIFY DATA ON ALL NODES
+--------------------------------------------------------------------------------
+
+  # Check existing data across all three clusters before the attack
+
+  psql -p 5432 -c "SELECT * FROM products;"
+  psql -p 5433 -c "SELECT * FROM products;"
+  psql -p 5434 -c "SELECT * FROM products;"
+
+  Expected: All three nodes should show identical, clean product data.
+
+--------------------------------------------------------------------------------
+STEP 2 — ATTACK: EXECUTE RANSOMWARE SIMULATION SCRIPT
+--------------------------------------------------------------------------------
+
+  # Run the sim3.sh script — this will:
+  #   - Insert new rows into the products table
+  #   - Encrypt all product columns using pgp_sym_encrypt (pgcrypto)
+  #   - Create a ransom_note table with a ransom message
+  #   - Drop README_RESTORE.txt ransom note files onto disk
+  #   - Rename table files in base/5/ to *.locked
+  #   - Rename WAL files in pg_wal/ to *.locked
+
+  bash scripts/sim3.sh
+
+--------------------------------------------------------------------------------
+STEP 3 — POST-ATTACK: CONFIRM DAMAGE ON PRIMARY
+--------------------------------------------------------------------------------
+
+  # Attempt to read the products table (should show encrypted/garbled data)
+  psql -p 5432 -c "SELECT * FROM products;"
+
+  # Monitor PostgreSQL logs for SELECT activity
+  tail -f /var/log/postgresql/postgresql-18-primary.log | grep -C5 SELECT
+
+  # Confirm the table is still queryable but data is encrypted
+  psql -p 5432 -c "SELECT * FROM products;"
+ 
+  # Verify what data is available on both replicas
+  psql -p 5433 -c "SELECT * FROM products;"
+ 
+  psql -p 5434 -c "SELECT * FROM products;"
+
+--------------------------------------------------------------------------------
+STEP 4 — INSPECT: DATA DIRECTORY & OID INFORMATION
+--------------------------------------------------------------------------------
+
+  # List all user tables in the primary
+  psql -p 5432 -c "SELECT schemaname, tablename
+                   FROM pg_tables
+                   WHERE schemaname NOT IN ('pg_catalog', 'information_schema');"
+
+  # Get the data directory path and OID of the current database
+  psql -p 5432 -c "SHOW data_directory;
+                   SELECT oid, datname
+                   FROM pg_database
+                   WHERE datname = current_database();"
+
+  # List locked table files (should show *.locked files)
+  ls /data/primary/base/5/
+
+  # Read the ransom note dropped by the attacker
+  cat /data/primary/base/5/README_RESTORE.txt
+
+  # List WAL files (should show *.locked files)
+  ls /data/primary/pg_wal/
+
+  # Check cluster control data — useful for LSN, timeline, and state info
+  /usr/lib/postgresql/18/bin/pg_controldata /data/primary
+
+--------------------------------------------------------------------------------
+STEP 5 — ASSESS: CHECK REPLICA STATUS
+--------------------------------------------------------------------------------
+
+  # Verify what data is available on both replicas
+  psql -p 5433 -c "SELECT * FROM products;"
+  psql -p 5434 -c "SELECT * FROM products;"
+
+  NOTE: Replica2 (5434) has a 90-minute recovery_min_apply_delay configured,
+        so it may still have clean pre-attack data.
+
+--------------------------------------------------------------------------------
+STEP 6 — PROTECT: PAUSE WAL REPLAY ON BOTH REPLICAS
+--------------------------------------------------------------------------------
+
+  # Immediately pause replay to prevent further attack propagation
+  psql -p 5433 -c "SELECT pg_wal_replay_pause();"
+  psql -p 5434 -c "SELECT pg_wal_replay_pause();"
+
+  # Confirm current WAL replay positions on both replicas
+  psql -p 5433 -c "SELECT pg_is_in_recovery(),
+                          pg_last_wal_replay_lsn(),
+                          pg_last_wal_receive_lsn();"
+
+  psql -p 5434 -c "SELECT pg_is_in_recovery(),
+                          pg_last_wal_replay_lsn(),
+                          pg_last_wal_receive_lsn();"
+
+--------------------------------------------------------------------------------
+STEP 7 — DIAGNOSE: REPLICA2 & BACKUP HEALTH CHECK
+--------------------------------------------------------------------------------
+
+  # Check row count on Replica2 — confirm clean data is present
+  psql -p 5434 -c "SELECT count(*) FROM products;"
+
+  # Check replication lag on Replica2
+  psql -p 5434 -c "SELECT now() - pg_last_xact_replay_timestamp() AS Lag;"
+
+  # Verify data integrity checksums on Replica2
+  /usr/lib/postgresql/18/bin/pg_checksums -D /data/replica2
+
+  # Check pgBackRest backup status for the primary stanza
+  pgbackrest --stanza=primary info
+
+  # List available WAL archive files for PITR
+  ls -l /var/lib/pgbackrest/archive/primary/18-1/
+
+--------------------------------------------------------------------------------
+STEP 8 — RECOVER: EXECUTE PITR RECOVERY ON REPLICA2
+--------------------------------------------------------------------------------
+
+  # Run the replica recovery script to restore Replica2 to pre-attack state
+  # This script performs Point-in-Time Recovery (PITR) using archived WAL
+
+  bash scripts/replica_recovery.sh
+
+  NOTE: Ensure the target recovery time is set to BEFORE the attack timestamp
+        captured in /data/primary/.time.txt
+
+--------------------------------------------------------------------------------
+STEP 9 — PROMOTE: RESUME WAL REPLAY & PROMOTE REPLICA2
+--------------------------------------------------------------------------------
+
+  # Resume WAL replay on Replica2
+  psql -p 5434 -c "SELECT pg_wal_replay_resume();"
+
+  # Confirm Replica2 has exited recovery mode (should return 'f' = false)
+  psql -p 5434 -c "SELECT pg_is_in_recovery();"
+
+  Expected output: f  (false = now acting as primary)
+
+--------------------------------------------------------------------------------
+STEP 10 — VALIDATE: CONFIRM RECOVERED DATA ON REPLICA2
+--------------------------------------------------------------------------------
+
+  # Verify the products table is clean and readable
+  psql -p 5434 -c "SELECT * FROM products;"
+
+  # Run ANALYZE and confirm live tuple count for the products table
+  psql -p 5434 -c "ANALYZE;
+                   SELECT schemaname, relname, n_live_tup
+                   FROM pg_stat_user_tables
+                   WHERE relname = 'products'
+                   ORDER BY n_live_tup DESC;"
+
+  Expected: n_live_tup should reflect the clean pre-attack row count.
+
+================================================================================
+  RECOVERY COMPLETE
+  New Primary : Replica2 on port 5434
+  Status      : Products table restored to pre-attack state
+================================================================================

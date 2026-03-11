@@ -1,0 +1,223 @@
+Run-Book for Scenario-4 :
+
+--Analytical WorkLoad
+sudo -u postgres bash /data/workshop/analytics/analytics.sh
+
+--Diagonasis Steps :
+--Stage 1:Check postgreSQL - Logs
+
+--Read the most recent log entries
+sudo tail -60 /data/analytics/log
+
+
+--Stage 2:Check System - Logs 
+
+--Check kernel ring buffer for any error activity 
+sudo cat /var/log/syslog | grep 'postgres'
+
+--Check the status of the postrgesql analytics CLUSTER
+sudo systemctl status postgresql@18-analytics.service
+
+--If state is in deactivating state, proceed with immediate stop of the cluster.
+/usr/bin/pg_ctlcluster --skip-systemctl-redirect -m immediate 18-analytics stop
+
+--Proceed with a clean start of the Cluster to Diagonase:
+sudo systemctl start postgresql@18-analytics.service
+
+--Stage 3: Table-Bloat
+-- Primary diagnostic: dead tuple ratios for all user tables
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    round(n_dead_tup::numeric / GREATEST(n_live_tup, 1) * 100, 2) AS dead_pct,
+    pg_size_pretty(pg_relation_size(relid)) AS table_size,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+
+--Expected Output:
+--The Statistics Table's will be freezed and wouldn't show tuples count.
+
+--For Precise bloat measurement
+SELECT
+    n.nspname AS schemaname,
+    c.relname,
+    (pgstattuple(c.oid)).tuple_count       AS live_tuples,
+    (pgstattuple(c.oid)).dead_tuple_count  AS dead_tuples,
+    (pgstattuple(c.oid)).dead_tuple_percent,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS table_size,
+    s.last_vacuum,
+    s.last_autovacuum
+FROM
+    pg_class c
+JOIN
+    pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN
+    pg_stat_user_tables s ON s.relid = c.oid
+WHERE
+    c.relkind = 'r' -- only normal tables
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND n.nspname !~ '^pg_toast'
+ORDER BY
+    dead_tuples DESC;
+
+-- Precise bloat measurement for payment_transactions
+SELECT
+    table_len,
+    pg_size_pretty(table_len::bigint) AS table_size,
+    tuple_count AS live_tuples,
+    dead_tuple_count AS dead_tuples,
+    round(dead_tuple_percent::numeric, 2) AS dead_pct,
+    pg_size_pretty(dead_tuple_len::bigint) AS dead_space,
+    pg_size_pretty(free_space::bigint) AS free_space
+FROM pgstattuple('payment_transactions');
+
+
+-- Repeat for orders
+SELECT
+    table_len,
+    pg_size_pretty(table_len::bigint) AS table_size,
+    tuple_count AS live_tuples,
+    dead_tuple_count AS dead_tuples,
+    round(dead_tuple_percent::numeric, 2) AS dead_pct,
+    pg_size_pretty(dead_tuple_len::bigint) AS dead_space,
+    pg_size_pretty(free_space::bigint) AS free_space
+FROM pgstattuple('orders');
+
+
+--Stage 4: Check the cluster-level autovacuum settings
+-- Check global autovacuum settings 
+
+SELECT name, setting, unit, source
+FROM pg_settings
+WHERE name IN (
+    'autovacuum',
+    'autovacuum_max_workers',
+    'autovacuum_vacuum_cost_delay',
+    'autovacuum_vacuum_cost_limit'
+)
+ORDER BY name;
+
+-- Check table-level overrides on the affected tables
+SELECT c.relname, c.reloptions
+FROM pg_class c
+WHERE c.relname IN ('payment_transactions', 'orders');
+
+-- Expected: {autovacuum_enabled=false} on both 
+
+show work_mem;
+show shared_buffers;
+show max_connections;
+
+--Stage 5: Parameter Validation (Autovacuum + Memory + Connection Limits)
+-- Validate current runtime values, source, and restart requirement
+SELECT
+    name,
+    setting,
+    unit,
+    source,
+    pending_restart
+FROM pg_settings
+WHERE name IN (
+    'autovacuum',
+    'autovacuum_max_workers',
+    'autovacuum_naptime',
+    'autovacuum_vacuum_scale_factor',
+    'autovacuum_analyze_scale_factor',
+    'autovacuum_vacuum_threshold',
+    'autovacuum_analyze_threshold',
+    'autovacuum_vacuum_cost_delay',
+    'autovacuum_vacuum_cost_limit',
+    'autovacuum_work_mem',
+    'work_mem',
+    'shared_buffers',
+    'max_connections'
+)
+ORDER BY name;
+
+-- Optional: confirm where values came from (postgresql.conf / ALTER SYSTEM / default)
+SELECT
+    name,
+    setting,
+    source,
+    sourcefile,
+    sourceline
+FROM pg_settings
+WHERE name IN ('work_mem', 'shared_buffers', 'max_connections', 'autovacuum', 'autovacuum_max_workers')
+ORDER BY name;
+
+-- Note:
+-- pending_restart = 't' means value is set but not active until PostgreSQL restart.
+
+-- Check if any vacuum worker is currently active
+SELECT pid, datname, relid::regclass AS table_name,
+       phase, heap_blks_total, heap_blks_scanned, heap_blks_vacuumed
+FROM pg_stat_progress_vacuum;
+
+-- Expected: empty result set (no vacuum in progress)
+
+=====================================================================================================================================================================
+
+--Phase A — Immediate Stabilization (Prevent Recurrence)
+--Recovery Phase
+ALTER SYSTEM SET work_mem = '32MB';
+ALTER SYSTEM SET autovacuum_max_workers = 3;
+ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms';
+ALTER SYSTEM SET max_connections = '25';
+ALTER TABLE payment_transactions RESET (autovacuum_enabled);
+ALTER TABLE orders RESET (autovacuum_enabled);
+
+
+SELECT pg_reload_conf();
+
+-- Verify global settings
+SHOW autovacuum_max_workers;        -- Expected: 3
+SHOW work_mem;						-- Expected: 32MB
+SHOW max_connections;
+SHOW autovacuum;					-- Expected: ON
+SHOW autovacuum_vacuum_cost_delay;   -- Expected: 2ms
+
+-- Verify table-level overrides are removed
+SELECT relname, reloptions
+FROM pg_class
+WHERE relname IN ('payment_transactions', 'orders');
+
+-- reloptions should be NULL for both tables
+
+
+-- Vacuum payment_transactions first (highest dead tuple count) 
+-- VACUUM (without FULL) does NOT lock the table for writes 
+VACUUM payment_transactions;
+VACUUM orders;
+VACUUM;
+
+==========================================================================================================================
+--Stage 6:
+--Final Verification
+-- Confirm dead tuples are reclaimed 
+
+SELECT
+    n.nspname AS schemaname,
+    c.relname,
+    (pgstattuple(c.oid)).tuple_count       AS live_tuples,
+    (pgstattuple(c.oid)).dead_tuple_count  AS dead_tuples,
+    (pgstattuple(c.oid)).dead_tuple_percent,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS table_size,
+    s.last_vacuum,
+    s.last_autovacuum
+FROM
+    pg_class c
+JOIN
+    pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN
+    pg_stat_user_tables s ON s.relid = c.oid
+WHERE
+    c.relkind = 'r'
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND n.nspname !~ '^pg_toast'
+ORDER BY
+    dead_tuples DESC;

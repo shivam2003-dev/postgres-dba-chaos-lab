@@ -1,0 +1,384 @@
+-- =================================================================================================
+-- PostgreSQL 18.3 — Corruption Investigation & Recovery Runbook
+-- =================================================================================================
+-- Cluster  : Nagulan  |  Data dir : /data/primary  |  Port : 5432
+-- Database : postgres |  Schema   : public
+-- Updated  : 2026-03
+--
+-- HOW TO USE THIS FILE
+-- ────────────────────
+-- Run sections in order top-to-bottom during an active investigation.
+-- Each query block has a title and a 2–3 line description explaining
+-- what the query does, why it matters, and when to use it.
+--
+-- Prerequisites
+-- ─────────────
+--   CREATE EXTENSION IF NOT EXISTS pageinspect;
+--   CREATE EXTENSION IF NOT EXISTS amcheck;
+--   psql < corruption_scanner_v4.sql       -- installs scanner procedures
+--   psql < row_level_diagnosis.sql         -- installs row-level prober
+-- =================================================================================================
+
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 1 — REPRODUCE / CONFIRM CORRUPTION                                                 │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── How to Simulate Corruption (Lab / Training Only) ──────────────────────────────────────────
+-- Runs the Python corruption simulator against specific rows in payment_transactions.
+-- The simulator stops PostgreSQL, overwrites column data bytes inside the heap file,
+-- recalculates the PG18 page checksum to avoid trivial detection, then restarts PostgreSQL.
+-- Only use this in a lab environment — this permanently corrupts the named rows.
+--
+--   python3 03b_corrupt_records.py \
+--       --db postgres \
+--       --table payment_transactions \
+--       --pk txn_id \
+--       --pk-values 101 205 398 512 777
+
+
+-- ── Query 1.1 : Spot-Check Known Corrupt PKs ──────────────────────────────────────────────────
+-- Attempts a direct SELECT of the specific rows suspected to be corrupt.
+-- If the rows are cached in shared_buffers this query may return stale (pre-corruption) data
+-- even though the on-disk bytes are already bad — restart PostgreSQL first to flush the cache.
+-- Use this as a quick first check immediately after corruption is reported or simulated.
+
+-- SELECT *
+-- FROM   payment_transactions
+-- WHERE  txn_id IN (101, 205, 398, 512, 777);
+
+-- ── Action 1.2 : Restart PostgreSQL to Flush the Buffer Cache ─────────────────────────────────
+-- PostgreSQL caches recently read pages in shared_buffers. If a corrupt page was read before
+-- the corruption was introduced, subsequent queries will hit the cache and silently return stale
+-- data, hiding the problem. Restarting forces all subsequent reads to come directly from disk.
+-- Always restart before running any definitive corruption scan or spot-check query.
+
+-- sudo systemctl status postgresql@18-primary.service
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 2 — IDENTIFY THE CORRUPTED TABLE                                                   │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Action 2.1 : Monitor the PostgreSQL Error Log in Real Time ────────────────────────────────
+-- The log is the first place corruption surfaces — PostgreSQL writes a line like
+-- "invalid page in block 2 of relation base/5/16482" the moment a bad block is read.
+-- The two numbers encode the database OID (5) and relfilenode (16482) — both are needed
+-- to identify which table is corrupt in Queries 2.2 and 2.3 below.
+
+grep -C5 "ERROR" /var/log/postgresql/postgresql-18-primary.log
+
+-- ── Query 2.2 : Translate Database OID to Database Name ──────────────────────────────────────
+-- The number immediately after "base/" in the error log path is the database OID.
+-- This query maps that OID to a human-readable database name so you know which database
+-- to connect to before running the relfilenode lookup in Query 2.3.
+-- Replace '5' with the OID from your log message.
+
+SELECT datname FROM pg_database WHERE  oid = '5';  
+
+-- ── Query 2.3 : Translate Relfilenode to Schema-Qualified Table Name ──────────────────────────
+-- The second number in the path (16482 in "base/5/16482") is the relfilenode — the physical
+-- file ID for the heap. This query maps it back to the exact table and schema name.
+-- Note: relfilenode changes after VACUUM FULL or CLUSTER; if this returns no rows,
+-- the table was recently rewritten — check pg_class.relfilenode directly.
+
+SELECT c.relname AS table_name, n.nspname AS schema_name, c.relkind AS relation_type FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid 
+WHERE pg_relation_filenode(c.oid) = 16482;   
+
+-- ── Query 2.4 : Confirm the Data Directory Path ───────────────────────────────────────────────
+-- Retrieves the base filesystem path of the PostgreSQL data directory (PGDATA).
+-- This path is needed for every file-level operation: pg_checksums, rsync backup,
+-- dd block repair, and pg_basebackup. On this cluster it is /data/primary but
+-- always confirm before constructing any OS-level command.
+
+SHOW data_directory;
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 3 — PRE-INVESTIGATION BACKUP                                                       │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 3.1 : Begin Online Backup Window ────────────────────────────────────────────────────
+-- Signals PostgreSQL to start a named online base backup window. The false parameter tells
+-- PostgreSQL not to force an immediate checkpoint, so the backup starts faster. All WAL
+-- generated from this call is preserved until pg_backup_stop() is called, ensuring a
+-- consistent restore point. Always run this before any investigation or repair attempt.
+
+SELECT pg_backup_start('pre_investigation_backup', false);
+
+-- ── Action 3.2 : Copy Data Directory with rsync ───────────────────────────────────────────────
+-- After pg_backup_start() is called, run this from a separate terminal to copy the entire
+-- data directory to the backup location. PostgreSQL continues serving traffic during the copy.
+-- The -a flag preserves permissions, timestamps, and symlinks; -r recurses all subdirectories.
+--
+--   rsync -ar /data/primary/ /data/backup/
+
+
+-- ── Query 3.3 : End Online Backup Window ──────────────────────────────────────────────────────
+-- Signals PostgreSQL that the rsync copy is complete. PostgreSQL writes a backup label file,
+-- forces a final checkpoint, and returns the LSN range and timeline of the backup — information
+-- required for Point-In-Time Recovery. Only run this after rsync completes successfully;
+-- do not run if rsync was interrupted or failed midway.
+
+SELECT * FROM pg_backup_stop(); 
+
+[OR]
+
+-- ── Action 3.4 : Take the full backup using the pg_basebackup binary ───────────────────────────────────────────────
+
+/usr/lib/postgresql/18/bin/pg_basebackup -h localhost -U postgres -D /data/backup -Fp -Xs -P
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 4 — CHECKSUM VERIFICATION                                                          │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 4.1 : Confirm Data Checksums Are Enabled ────────────────────────────────────────────
+-- Data checksums allow PostgreSQL to detect silent corruption caused by storage hardware or OS
+-- bugs at the moment a page is read from disk. In PostgreSQL 18 checksums are ON by default
+-- for new clusters. If this returns "off", silent corruption in column bytes will not be caught
+-- at the page level — only logical header checks (xmin, infomask) will detect corruption.
+
+SHOW data_checksums;
+
+-- Alternative: returns name/setting pair suitable for scripting or monitoring queries
+
+SELECT name, setting FROM pg_settings WHERE name = 'data_checksums';
+
+-- ── Action 4.2 : Cluster-Wide Checksum Verification via pg_checksums ─────────────────────────
+-- Reads every data page in the cluster and verifies the stored checksum against a freshly
+-- computed one — the only way to audit ALL pages, including those not referenced by live tuples.
+-- pg_checksums requires the cluster to be STOPPED first; expect it to take minutes to hours
+-- depending on total database size. Any failing page is reported with its file path and block.
+--
+sudo systemctl stop postgresql@18-primary.service
+/usr/lib/postgresql/18/bin/pg_checksums --check -D /data/primary
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 5 — TWO-PASS CORRUPTION SCANNER                                                    │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 5.1 : Run Full Database Two-Pass Scan ───────────────────────────────────────────────
+-- Runs both detection passes across every user table in the public schema.
+-- Pass 1 (pageinspect) reads raw 8KB blocks and checks each tuple's physical header fields —
+-- catching unreadable pages, invalid xmin values, and contradictory infomask flag combinations.
+-- Pass 2 (verify_heapam via amcheck) performs a deep logical check: null bitmap alignment,
+-- TOAST pointer validity, HOT chain integrity, and attribute width violations. All findings
+-- are written to public.corruption_scan_results with block number, item index, ctid, error
+-- type, and raw header values. Omit p_verify_heapam to run Pass 1 only (significantly faster).
+
+CALL scan_all_tables_for_corruption(p_verify_heapam => TRUE);
+
+-- ── Query 5.2 : View Latest Scan Results — Full Detail Per Corrupt Tuple ──────────────────────
+-- Returns every corrupt tuple found in the most recent scan run, scoped to a 5-second
+-- timestamp window so results from previous runs do not mix in. Each row includes the detection
+-- pass (pageinspect or verify_heapam), physical location (block_num, item_index, ctid_val),
+-- error classification, raw tuple header fields (xmin, xmax, infomask), and the exact
+-- PostgreSQL error message. Use this to pinpoint which blocks and tuples need immediate action.
+
+SELECT block_num, ctid_val, detection_pass, error_type, error_detail FROM v_corruption_latest WHERE  table_name = 'payment_transactions' ORDER  BY block_num, detection_pass;
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 6 — RAW PAGE HEADER INSPECTION                                                     │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 6.1 : Inspect Raw 8KB Page Header Fields ────────────────────────────────────────────
+-- Reads the PageHeaderData structure of a specific block and returns its low-level fields:
+-- LSN (last WAL record that modified this page), checksum, flags, free space pointers
+-- (pd_lower / pd_upper / pd_special), and the page version number. A valid page has
+-- pd_lower <= pd_upper <= pd_special and a non-zero LSN. If get_raw_page() itself throws
+-- an error, the entire block is physically unreadable — confirming UNREADABLE_PAGE status.
+-- Replace 9 with the actual block number from v_corruption_latest.
+
+SELECT * FROM page_header (get_raw_page('payment_transactions', 2)); 
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 7 — INDEX INTEGRITY CHECKS (amcheck)                                               │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 7.1 : Cross-Reference Index Entries Against the Heap ───────────────────────────────
+-- bt_index_parent_check() with heapallindexed => TRUE is a deeper check than bt_index_check().
+-- It verifies every index entry by reading its corresponding heap tuple — confirming that every
+-- row reachable via the index can actually be read from the table. If the heap blocks are
+-- corrupt, this will throw an error identifying the exact block number, providing independent
+-- confirmation of the heap corruption already found by the scanner. Slower than bt_index_check()
+-- because it must access the heap; run this after bt_index_check() passes cleanly.
+
+SELECT bt_index_parent_check('idx_payment_status', heapallindexed => true);
+
+-- ── Query 7.2 : Batch Index Check Across Multiple Tables ─────────────────────────────────────
+-- Runs bt_index_parent_check() with heapallindexed => TRUE against every index on the named
+-- tables in a single query, returning schema, table, and index name alongside the check result.
+-- A NULL result_means the check passed for that index; a non-NULL result contains the specific
+-- error — invalid page header, checksum mismatch, out-of-order keys, or corrupted tuple layout.
+-- Extend the IN list to include all tables flagged by the scanner in Section 5.
+
+SELECT
+    n.nspname  AS schema_name,
+    c.relname  AS table_name,
+    i.relname  AS index_name,
+    bt_index_parent_check(i.oid, heapallindexed => true) AS check_result
+FROM   pg_index     x
+JOIN   pg_class     c ON c.oid = x.indrelid
+JOIN   pg_class     i ON i.oid = x.indexrelid
+JOIN   pg_namespace n ON n.oid = c.relnamespace
+WHERE  n.nspname = 'public'
+  AND  c.relname IN ('payment_transactions');
+
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 8 — ROW-LEVEL DIAGNOSIS                                                            │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 8.1 : Row-By-Row Corruption Probe — Single Table ───────────────────────────────────
+-- Walks every 8KB block via pageinspect, then attempts a live SELECT via ctid for every tuple
+-- slot found. Each unreadable row is written to public.row_corruption_diagnosis with
+-- is_corrupted = TRUE, the ctid, block number, item index, raw tuple header, and the error.
+-- A third phase merges verify_heapam findings from corruption_scan_results so all corruption
+-- sources — physical and logical — are unified in a single queryable table with a shared
+-- is_corrupted flag, making the NOT IN exclusion query in 8.3 straightforward and complete.
+
+CALL diagnose_table_rows('payment_transactions', 'txn_id');
+
+-- ── Query 8.2 : List All Corrupt Rows with Full Details ──────────────────────────────────────
+-- Returns every row flagged as corrupt from the most recent diagnosis run, showing the primary
+-- key value (NULL when the entire block is unreadable and individual PKs cannot be extracted),
+-- physical location (ctid, block, item), error classification, the full PostgreSQL error
+-- message, raw xmin transaction ID, and tuple byte length. Rows where pk_value IS NULL
+-- represent UNREADABLE_BLOCK entries — use the simulator manifest at
+-- /tmp/record_corruption_payment_transactions.txt to recover specific PKs in a lab environment.
+
+SELECT
+    pk_value,
+    ctid_val,
+    block_num,
+    item_index,
+    error_type,
+    error_detail,
+    raw_xmin,
+    tuple_len,
+    diagnosed_at
+FROM   row_corruption_diagnosis
+WHERE  table_name   = 'payment_transactions'
+  AND  is_corrupted = TRUE
+ORDER  BY block_num, item_index;
+
+-- ── Query 8.3 : Row Diagnosis Summary — Healthy vs Corrupt Per Table ──────────────────────────
+-- Aggregates diagnosis results per table showing total_rows_in_table from pg_class.reltuples,
+-- corrupt rows broken down by error type (UNREADABLE_BLOCK, CORRUPT_ROW, VERIFY_HEAPAM_FAILED,
+-- HEAPAM_VIOLATION), and corrupt_pct of the table affected. A high corrupt_pct or many
+-- unreadable_blocks indicates full recovery from replica is more practical than surgical
+-- block repair — use this view to guide the repair strategy decision.
+
+SELECT * FROM v_row_diagnosis_summary ORDER BY corrupt_rows DESC;
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 9 — REPLICATION STATUS                                                             │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Query 9.1 : Check Streaming Replication Lag and Replica Health (on Primary) ──────────────
+-- Queries pg_stat_replication on the PRIMARY to show the state of all connected standbys —
+-- their sync state (sync / async / quorum), LSN positions for sent / write / flush / replay,
+-- and measured lag times for each WAL processing stage. A replica with low replay_lag has
+-- up-to-date data suitable for block-level dd repair or pg_dump recovery. High replay_lag
+-- means the replica may not yet have the most recent primary changes — verify independently.
+
+SELECT
+    application_name,
+    client_addr,
+    state,
+    sync_state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    write_lag,
+    flush_lag,
+    replay_lag
+FROM   pg_stat_replication;
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 10 — SURGICAL BLOCK REPAIR (Single Block from Replica)                            │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Action 10.1 : Copy One 8KB Block from Replica to Primary via dd ──────────────────────────
+-- Uses dd to copy a single 8KB block from the replica's heap file and overwrite the matching
+-- block on the primary. bs=8192 matches PostgreSQL's page size; count=1 copies exactly one
+-- block; skip=N positions the read head at block N on the source (replica); seek=N positions
+-- the write head at block N on the destination (primary); conv=notrunc prevents truncating
+-- the rest of the destination file. Use this when only 1–2 blocks are affected — it is the
+-- least disruptive method and leaves all other blocks on the primary untouched.
+-- PostgreSQL MUST be stopped on the primary before running dd.
+--
+--   sudo systemctl stop postgresql@18-primary.service
+--
+--   dd if=/data/replica2/base/5/16482 \
+--      of=/data/primary/base/5/16482  \
+--      bs=8192 count=1 skip=2 seek=2 conv=notrunc
+--              ↑ skip=2 → read from block 2 on replica
+--                          seek=2 → write to block 2 on primary
+--
+--   sudo systemctl start postgresql@18-primary.service
+
+
+-- ┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+-- │  SECTION 11 — FULL TABLE RECOVERY FROM REPLICA                                              │
+-- └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+-- ── Action 11.1 : Dump Healthy Table from Replica via pg_dump ────────────────────────────────
+-- Connects to the replica (port 5434) and exports the full payment_transactions table to a
+-- plain-text SQL file containing CREATE TABLE DDL and INSERT statements for all rows.
+-- Use this approach when multiple non-contiguous blocks are corrupt — surgical dd repair
+-- becomes impractical with more than 2–3 bad blocks. The -t flag limits the dump to the
+-- named table; omit -t to dump the entire database.
+
+/usr/lib/postgresql/18/bin/pg_dump -U postgres -d postgres -p 5434 -t payment_transactions > /data/backup/transactions_backup.sql
+
+-- ── Query 11.2 : Rename Corrupt Table Before Restore ─────────────────────────────────────────
+-- Renames the corrupt table to a _corrupted suffix rather than dropping it immediately.
+-- This preserves the corrupt data as a forensic reference so you can later determine exactly
+-- which rows were lost and what their last known values were before corruption occurred.
+-- Once the restored table is verified as healthy and row counts match the replica, the
+-- _corrupted copy can be safely dropped.
+
+DROP TABLE public.payment_transactions;
+
+-- ── Action 11.3 : Restore Healthy Table from pg_dump File ────────────────────────────────────
+-- Loads the SQL dump taken from the replica into the primary, recreating payment_transactions
+-- with clean data. The dump file contains the full CREATE TABLE DDL followed by all INSERT
+-- statements for every row. After restore, verify that the row count matches the replica and
+-- that specific previously-corrupt PKs (e.g. 101, 205, 208) are now readable before
+-- dropping the _corrupted copy.
+
+psql -U postgres -d postgres -p 5432  -f /data/backup/transactions_backup.sql
+
+-- ── Query 11.4 : Rebuild Indexes and Refresh Table Statistics Post-Recovery ───────────────────
+-- After restoring a table from a dump file all indexes must be rebuilt from scratch because the
+-- rename/restore cycle leaves them potentially stale or inconsistent with the new table data.
+-- REINDEX TABLE rebuilds every index on the table in a single operation. ANALYZE then collects
+-- fresh statistics so the query planner can generate optimal execution plans for the table.
+-- Both commands must complete successfully before returning the table to production traffic.
+
+REINDEX TABLE public.payment_transactions;
+ANALYZE public.payment_transactions;
+
+-- Counts only rows PostgreSQL can successfully read. 
+-- Rows on unreadable blocks (2 and 12) are silently skipped by the heap scan.
+ 
+SELECT count(*) FROM payment_transactions;
+ 
+-- bt_index_parent_check() with heapallindexed => TRUE is the correct function
+-- for cross-referencing indexes against heap tuples.
+-- bt_index_check() does NOT support the heapallindexed parameter — that is
+-- only available on bt_index_parent_check().
+ 
+SELECT
+    c.relname                                              AS index_name,
+    bt_index_parent_check(c.oid, heapallindexed => true)   AS result
+FROM   pg_class c
+JOIN   pg_index i ON c.oid = i.indexrelid
+WHERE  i.indrelid = 'payment_transactions'::regclass;
+ 
+# Original used wrong database (wcsbackup) and no port.
+# -p 5432  → targets the primary only, never a replica
+# -d postgres → your actual database
+# --schema=public → scope to your schema
+# -f /dev/null → discard output, only care about errors
+pg_dump -U postgres -p 5432 -d postgres --schema=public -f /dev/null 2>&1 | grep -i error
